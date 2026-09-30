@@ -479,14 +479,11 @@ input[type=checkbox]{ accent-color:var(--verde); width:15px; height:15px; }
   padding:0 1.6mm; line-height:1.18;
 }
 .seg textarea:focus{ background:color-mix(in srgb, var(--verde) 8%, transparent); }
-.seg .girar{
-  position:absolute; top:1px; right:1px; z-index:2; width:18px; height:18px; padding:0;
-  border:1px solid var(--linea); border-radius:5px; background:var(--panel);
-  font-size:11px; line-height:1; display:grid; place-items:center; opacity:0; transition:opacity .12s;
-}
-.seg:hover .girar, .seg:focus-within .girar{ opacity:1; }
-@media (pointer: coarse){ .seg .girar{ opacity:.8; } }
-.seg .girar[aria-pressed="true"]{ background:var(--verde); border-color:var(--verde); color:#fff; opacity:1; }
+.seg.activo{ box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--verde) 55%, transparent); }
+.seg-ctrl{ display:flex; gap:4px; align-items:center; font-size:11.5px; color:var(--tinta-2); }
+.seg-ctrl .btn{ padding:2px 7px; font-size:11.5px; border-radius:5px; }
+.seg-ctrl .valor{ min-width:62px; text-align:center; font-variant-numeric:tabular-nums; }
+.seg-ctrl .btn[aria-pressed="true"]{ background:var(--verde); border-color:var(--verde); color:#fff; }
 
 .tira.usada .papel{ opacity:.35; }
 .tira.usada .papel::after{ content:""; position:absolute; inset:0; background:repeating-linear-gradient(
@@ -553,10 +550,11 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     <label class="nombre-tablero">Tablero
       <input type="text" id="nombre-tablero" placeholder="Sala A, obra Biogénesis…" maxlength="60">
     </label>
-    <label>Letra hasta
+    <label>Letra máxima
       <select id="op-tam">
         <option value="8">8 pt</option><option value="9">9 pt</option><option value="10">10 pt</option>
         <option value="11" selected>11 pt</option><option value="12">12 pt</option><option value="14">14 pt</option>
+        <option value="16">16 pt</option><option value="18">18 pt</option><option value="20">20 pt</option>
       </select>
     </label>
     <label><input type="checkbox" id="op-negrita" checked> Negrita</label>
@@ -593,22 +591,109 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     return doc.getTextWidth(txt) || 0.01;
   }
 
-  function calcularPt(doc, lineas, anchoUtil, altoUtil, maxPt, negrita) {
-    if (!lineas.length) return maxPt;
-    var w10 = 0.01;
-    for (var i = 0; i < lineas.length; i++) w10 = Math.max(w10, anchoMm(doc, lineas[i], negrita));
-    var porAncho = 10 * (anchoUtil / w10);
-    var porAlto = (altoUtil / (lineas.length * INTERL)) * 72 / 25.4;
-    return Math.max(MIN_PT, Math.min(maxPt, porAncho, porAlto));
+  function anchoEspacio(doc, negrita) {
+    return Math.max(0.2, anchoMm(doc, "n n", negrita) - anchoMm(doc, "nn", negrita));
   }
 
+  // Corta las palabras en renglones que no pasen de "limite" (medidas a 10 pt).
+  function empaquetar(palabras, anchos, espacio, limite) {
+    var lineas = [], actual = [], ancho = 0;
+    for (var i = 0; i < palabras.length; i++) {
+      if (!actual.length) { actual = [palabras[i]]; ancho = anchos[i]; }
+      else if (ancho + espacio + anchos[i] <= limite + 1e-9) { actual.push(palabras[i]); ancho += espacio + anchos[i]; }
+      else { lineas.push(actual.join(" ")); actual = [palabras[i]]; ancho = anchos[i]; }
+    }
+    if (actual.length) lineas.push(actual.join(" "));
+    return lineas;
+  }
+
+  // Renglón más angosto posible usando como mucho k renglones.
+  function limiteParaLineas(palabras, anchos, espacio, k) {
+    var total = 0, mayor = 0;
+    for (var i = 0; i < anchos.length; i++) { total += anchos[i]; mayor = Math.max(mayor, anchos[i]); }
+    total += espacio * Math.max(0, anchos.length - 1);
+    if (k <= 1 || anchos.length <= 1) return total;
+    var lo = mayor, hi = total;
+    for (var it = 0; it < 40; it++) {
+      var medio = (lo + hi) / 2;
+      if (empaquetar(palabras, anchos, espacio, medio).length <= k) hi = medio; else lo = medio;
+    }
+    return hi;
+  }
+
+  function ptPorAlto(altoUtil, n) { return (altoUtil / (n * INTERL)) * 72 / 25.4; }
+
   /**
-   * Medidas de un segmento ubicado en (x, y) de la hoja, de ancho w mm.
-   * Devuelve el cuerpo de letra y el desplazamiento mínimo (dx, dy) que hace
-   * falta para que el texto no caiga en el borde que la impresora no imprime.
+   * Arma los renglones y el cuerpo de letra. Respeta los saltos de línea que
+   * escribió la persona; si no hay, parte el texto solo para aprovechar el alto.
+   * seg.pt fuerza un tamaño fijo para ese cartelito.
    */
+  function disponer(doc, texto, opts, anchoUtil, altoUtil, ptFijo) {
+    var bloques = lineasDe(texto, opts.mayus);
+    var maxPt = opts.maxPt, negrita = opts.negrita;
+    if (!bloques.length) return { lineas: [], pt: ptFijo || maxPt, limite: anchoUtil };
+
+    var espacio = anchoEspacio(doc, negrita);
+    function anchosDe(linea) {
+      var palabras = linea.split(/\s+/).filter(Boolean), anchos = [];
+      for (var i = 0; i < palabras.length; i++) anchos.push(anchoMm(doc, palabras[i], negrita));
+      return { palabras: palabras, anchos: anchos };
+    }
+
+    // Tamaño fijo elegido a mano: solo se acomodan los renglones a ese tamaño.
+    if (ptFijo) {
+      var pt = Math.max(MIN_PT, ptFijo), salida = [];
+      for (var vuelta = 0; vuelta < 2; vuelta++) {
+        salida = [];
+        var limite10 = anchoUtil * 10 / pt;
+        for (var b = 0; b < bloques.length; b++) {
+          var d = anchosDe(bloques[b]);
+          salida = salida.concat(empaquetar(d.palabras, d.anchos, espacio, limite10));
+        }
+        var cabe = ptPorAlto(altoUtil, salida.length);   // que no se salga de la etiqueta
+        if (pt <= cabe + 0.01) break;
+        pt = Math.max(MIN_PT, cabe);
+      }
+      return { lineas: salida, pt: pt, limite: anchoUtil };
+    }
+
+    // Saltos de línea escritos a mano: se respetan tal cual.
+    if (bloques.length > 1) {
+      var w10 = 0.01;
+      for (var j = 0; j < bloques.length; j++) w10 = Math.max(w10, anchoMm(doc, bloques[j], negrita));
+      var ptM = Math.max(MIN_PT, Math.min(maxPt, 10 * (anchoUtil / w10), ptPorAlto(altoUtil, bloques.length)));
+      return { lineas: bloques, pt: ptM, limite: anchoUtil };
+    }
+
+    // Una sola frase: se prueba en 1, 2, 3 o 4 renglones y gana la letra más grande.
+    var dd = anchosDe(bloques[0]);
+    var mejorPt = MIN_PT;
+    for (var k = 1; k <= 4; k++) {
+      var lim = limiteParaLineas(dd.palabras, dd.anchos, espacio, k);
+      var lineasK = empaquetar(dd.palabras, dd.anchos, espacio, lim);
+      var ptK = Math.min(maxPt, 10 * (anchoUtil / lim), ptPorAlto(altoUtil, lineasK.length));
+      if (ptK > mejorPt) mejorPt = ptK;
+      if (lineasK.length < k) break;
+    }
+    // Con ese tamaño, los renglones se cortan usando todo el ancho disponible
+    // (igual que los corta el navegador en la vista previa).
+    var pt2 = Math.max(MIN_PT, mejorPt), lineasF = [];
+    for (var it = 0; it < 4; it++) {
+      lineasF = empaquetar(dd.palabras, dd.anchos, espacio, anchoUtil * 10 / pt2);
+      var ancho10 = 0.01;
+      for (var q = 0; q < lineasF.length; q++) ancho10 = Math.max(ancho10, anchoMm(doc, lineasF[q], negrita));
+      var ptC = Math.max(MIN_PT, Math.min(maxPt, 10 * (anchoUtil / ancho10), ptPorAlto(altoUtil, lineasF.length)));
+      if (ptC <= pt2 + 0.02) { pt2 = Math.min(pt2, ptC); break; }
+      pt2 = ptC;
+    }
+    lineasF = empaquetar(dd.palabras, dd.anchos, espacio, anchoUtil * 10 / pt2);
+    var ancho10f = 0.01;
+    for (var r = 0; r < lineasF.length; r++) ancho10f = Math.max(ancho10f, anchoMm(doc, lineasF[r], negrita));
+    pt2 = Math.max(MIN_PT, Math.min(pt2, 10 * (anchoUtil / ancho10f), ptPorAlto(altoUtil, lineasF.length)));
+    return { lineas: lineasF, pt: pt2, limite: anchoUtil };
+  }
+
   function medidasSegmento(doc, seg, x, y, w, opts) {
-    var lineas = lineasDe(seg.txt, opts.mayus);
     var rot = !!seg.rot;
     var m = Math.max(0, Number(opts.margen) || 0);
     var x1 = Math.max(x, m), x2 = Math.min(x + w, HOJA_ANCHO - m);
@@ -616,26 +701,27 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     if (x2 - x1 < 1) { x1 = x; x2 = x + w; }
     if (y2 - y1 < 1) { y1 = y; y2 = y + ALTO; }
     var aw = x2 - x1, ah = y2 - y1;
-
     var anchoUtil = (rot ? ah : aw) - 2 * PAD_X;
     var altoUtil = (rot ? aw : ah) - 2 * PAD_Y;
-    var pt = calcularPt(doc, lineas, anchoUtil, altoUtil, opts.maxPt, opts.negrita);
-    var em = pt * 25.4 / 72, lh = em * INTERL;
+
+    var d = disponer(doc, seg.txt, opts, anchoUtil, altoUtil, Number(seg.pt) || 0);
+    var pt = d.pt, em = pt * 25.4 / 72, lh = em * INTERL;
 
     var wTexto = 0;
-    for (var i = 0; i < lineas.length; i++) wTexto = Math.max(wTexto, anchoMm(doc, lineas[i], opts.negrita) * pt / 10);
-    var n = Math.max(lineas.length, 1);
+    for (var i = 0; i < d.lineas.length; i++) wTexto = Math.max(wTexto, anchoMm(doc, d.lineas[i], opts.negrita) * pt / 10);
+    var n = Math.max(d.lineas.length, 1);
     var bloqueW = rot ? n * lh : wTexto;
     var bloqueH = rot ? wTexto : n * lh;
 
     var cx = x + w / 2, cy = y + ALTO / 2, dx = 0, dy = 0;
-    if (lineas.length) {
+    if (d.lineas.length) {
       if (cx - bloqueW / 2 < x1) dx = x1 - (cx - bloqueW / 2);
       else if (cx + bloqueW / 2 > x2) dx = x2 - (cx + bloqueW / 2);
       if (cy - bloqueH / 2 < y1) dy = y1 - (cy - bloqueH / 2);
       else if (cy + bloqueH / 2 > y2) dy = y2 - (cy + bloqueH / 2);
     }
-    return { lineas: lineas, rot: rot, pt: pt, em: em, lh: lh, dx: dx, dy: dy };
+    return { lineas: d.lineas, rot: rot, pt: pt, em: em, lh: lh, dx: dx, dy: dy,
+             limite: Math.min(anchoUtil, Math.max(d.limite, 1)), fijo: !!(Number(seg.pt) || 0) };
   }
 
   function dibujarSegmento(doc, x, y, w, seg, opts) {
@@ -687,7 +773,7 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     MOD: MOD, ANCHO: ANCHO, ALTO: ALTO, COLS: COLS, FILAS: FILAS,
     HOJA_ANCHO: HOJA_ANCHO, HOJA_ALTO: HOJA_ALTO,
     PAD_X: PAD_X, PAD_Y: PAD_Y, INTERL: INTERL,
-    lineasDe: lineasDe, calcularPt: calcularPt,
+    lineasDe: lineasDe, disponer: disponer,
     medidasSegmento: medidasSegmento, dibujarSegmento: dibujarSegmento, dibujarHoja: dibujarHoja
   };
   raiz.CartelitosPDF = api;
@@ -706,10 +792,11 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
   };
   var CLAVE = "cartelitos:borrador";
   var medidor = null;
+  var activo = { i:-1, s:-1 };
 
   /* ---------- estado ---------- */
   function cantidad(f){ return f.cols * FILAS; }
-  function tiraVacia(f){ return { usada:false, segs:[{ mod:f.mods, txt:"", rot:false }] }; }
+  function tiraVacia(f){ return { usada:false, segs:[{ mod:f.mods, txt:"", rot:false, pt:0 }] }; }
   function hojaVacia(f){ var a = []; for (var i=0;i<cantidad(f);i++) a.push(tiraVacia(f)); return a; }
   function estadoVacio(){
     return {
@@ -729,7 +816,9 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
         var m = Math.round(Number(o.segs[s].mod) || 0);
         if (m < 1 || suma + m > f.mods) continue;
         suma += m;
-        segs.push({ mod:m, txt:String(o.segs[s].txt || "").slice(0,200), rot: !!o.segs[s].rot });
+        var propio = Math.round(Number(o.segs[s].pt) || 0);
+        if (propio && (propio < 4 || propio > 40)) propio = 0;
+        segs.push({ mod:m, txt:String(o.segs[s].txt || "").slice(0,200), rot: !!o.segs[s].rot, pt: propio });
       }
       if (suma !== f.mods || !segs.length) continue;
       salida[i] = { usada: !!o.usada, segs: segs };
@@ -784,12 +873,12 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
       var ini = acum, fin = acum + segs[s].mod;
       if (pos === fin && s < segs.length-1){            // sacar el corte: unir con el siguiente
         var a = segs[s], b = segs[s+1];
-        segs.splice(s, 2, { mod:a.mod + b.mod, txt: a.txt || b.txt, rot: a.rot && b.rot });
+        segs.splice(s, 2, { mod:a.mod + b.mod, txt: a.txt || b.txt, rot: a.rot && b.rot, pt: 0 });
         return;
       }
       if (pos > ini && pos < fin){                      // agregar el corte: partir el segmento
-        segs.splice(s, 1, { mod: pos - ini, txt: segs[s].txt, rot: segs[s].rot },
-                           { mod: fin - pos, txt: "", rot: segs[s].rot });
+        segs.splice(s, 1, { mod: pos - ini, txt: segs[s].txt, rot: segs[s].rot, pt: segs[s].pt || 0 },
+                           { mod: fin - pos, txt: "", rot: segs[s].rot, pt: segs[s].pt || 0 });
         return;
       }
       acum = fin;
@@ -865,6 +954,9 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     usada.appendChild(chk);
     usada.appendChild(document.createTextNode("ya usada"));
     enc.appendChild(usada);
+    var ctrl = document.createElement("div");
+    ctrl.className = "seg-ctrl";
+    enc.appendChild(ctrl);
     enc.appendChild(Object.assign(document.createElement("div"), { className:"relleno" }));
 
     var herr = document.createElement("div");
@@ -892,20 +984,12 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
       ta.value = seg.txt; ta.spellcheck = false; ta.disabled = et.usada;
       ta.setAttribute("aria-label", "Texto del cartelito " + (s+1) + " de la etiqueta " + (i+1));
       ta.addEventListener("input", function(){
-        seg.txt = ta.value; ajustarTextarea(ta, i, s); guardarBorrador();
+        seg.txt = ta.value; ajustarTextarea(ta, i, s); pintarControles(i); guardarBorrador();
       });
+      ta.addEventListener("focus", function(){ activo = { i:i, s:s }; marcarActivo(); pintarControles(i); });
       div.appendChild(ta);
 
-      if (!et.usada){
-        var girar = document.createElement("button");
-        girar.className = "girar"; girar.type = "button";
-        girar.textContent = "⟲";
-        girar.title = "Texto vertical";
-        girar.setAttribute("aria-pressed", seg.rot ? "true" : "false");
-        girar.addEventListener("click", function(){ seg.rot = !seg.rot; guardarBorrador(); redibujarTira(i); });
-        div.appendChild(girar);
-      }
-
+      if (activo.i === i && activo.s === s) div.classList.add("activo");
       papel.appendChild(div);
       ajustarTextarea(ta, i, s);
     });
@@ -939,14 +1023,82 @@ dialog input[type=text]{ font:inherit; width:100%; padding:8px 10px; border-radi
     return art;
   }
 
+  function marcarActivo(){
+    hoja.querySelectorAll(".seg.activo").forEach(function(d){ d.classList.remove("activo"); });
+    var art = hoja.querySelector('.tira[data-i="' + activo.i + '"]');
+    if (!art) return;
+    var div = art.querySelectorAll(".seg")[activo.s];
+    if (div) div.classList.add("activo");
+    hoja.querySelectorAll(".seg-ctrl").forEach(function(c){ if (c.closest(".tira") !== art) c.textContent = ""; });
+  }
+
+  function btnCtrl(texto, titulo, fn){
+    var b = document.createElement("button");
+    b.className = "btn"; b.type = "button"; b.textContent = texto; b.title = titulo || "";
+    b.addEventListener("mousedown", function(ev){ ev.preventDefault(); });   // no perder el cursor
+    b.addEventListener("click", fn);
+    return b;
+  }
+
+  function enfocar(i, s){
+    var art = hoja.querySelector('.tira[data-i="' + i + '"]');
+    if (!art) return;
+    var ta = art.querySelectorAll(".seg")[s] && art.querySelectorAll(".seg")[s].querySelector("textarea");
+    if (ta) ta.focus();
+  }
+
+  function pintarControles(i){
+    var art = hoja.querySelector('.tira[data-i="' + i + '"]');
+    if (!art) return;
+    var ctrl = art.querySelector(".seg-ctrl");
+    if (!ctrl) return;
+    ctrl.textContent = "";
+    if (activo.i !== i) return;
+    var et = ets()[i], seg = et.segs[activo.s];
+    if (!seg || et.usada) return;
+    var s = activo.s;
+    var m = medidasDe(seg, i, s);
+
+    function cambiar(paso){
+      var base = seg.pt || Math.round(m.pt);
+      seg.pt = Math.min(40, Math.max(4, base + paso));
+      refrescarSegmento(i, s);
+    }
+    ctrl.appendChild(btnCtrl("A−", "Achicar la letra de este cartelito", function(){ cambiar(-1); }));
+    var valor = document.createElement("span");
+    valor.className = "valor";
+    valor.textContent = seg.pt ? seg.pt + " pt" : "auto " + Math.round(m.pt) + " pt";
+    ctrl.appendChild(valor);
+    ctrl.appendChild(btnCtrl("A+", "Agrandar la letra de este cartelito", function(){ cambiar(1); }));
+    if (seg.pt) ctrl.appendChild(btnCtrl("auto", "Volver al tamaño automático", function(){
+      seg.pt = 0; refrescarSegmento(i, s);
+    }));
+    var vert = btnCtrl("Vertical", "Poner el texto de costado", function(){
+      seg.rot = !seg.rot; guardarBorrador(); redibujarTira(i); enfocar(i, s);
+    });
+    vert.setAttribute("aria-pressed", seg.rot ? "true" : "false");
+    ctrl.appendChild(vert);
+  }
+
+  function refrescarSegmento(i, s){
+    var art = hoja.querySelector('.tira[data-i="' + i + '"]');
+    if (!art) return;
+    var div = art.querySelectorAll(".seg")[s];
+    if (div) ajustarTextarea(div.querySelector("textarea"), i, s);
+    pintarControles(i);
+    guardarBorrador();
+  }
+
   function redibujarTira(i){
     var viejo = hoja.querySelector('.tira[data-i="' + i + '"]');
     var nuevo = dibujarTira(i);
     if (viejo) hoja.replaceChild(nuevo, viejo); else hoja.appendChild(nuevo);
+    if (activo.i === i) pintarControles(i);
   }
 
   function dibujarTodo(){
     var f = fmt();
+    activo = { i:-1, s:-1 };
     hoja.textContent = "";
     for (var i=0; i<ets().length; i++) hoja.appendChild(dibujarTira(i));
     document.getElementById("sub").textContent =
